@@ -1,6 +1,7 @@
 # Paper Review: The Slab Allocator: An Object-Caching Kernel Allocator.
 
 ---
+[TOC]
 
 ### Basic Ideas
 
