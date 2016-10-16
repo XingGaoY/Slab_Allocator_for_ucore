@@ -66,7 +66,7 @@ Here, the paper mentioned to observations:
 #### Caches
 
 Each cache has a front and back end:
-![1](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review_and_Summary/img/cache.png)
+![1](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review%20and%20Summary/img/cache.png)
 
 * The front end is the public interface to the allocator, which moves objects in and out
 * The back end manages the flow of real memory through the cache. ** Note that all back-end activity is triggered solely by memory presure **  
@@ -88,12 +88,12 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
 
 * In turn, each buffer in the slab is managed by a `kmem_bufctl` structure thar holds the freelist linkage, buffer address and a back-pointer to the controlling slab.
   A slab may look like this:
-  ![](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review_and_Summary/img/slab.png)
+  ![](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review%20and%20Summary/img/slab.png)
 
   ##### Slab Layout for Small Objects
 
   For objects smaller than 1\/8 page, a slab is built by allocating a page, placing the slab data at the end and dividing the rest into equal-size buffers:
-  ![](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review_and_Summary/img/slab_page.png)
+  ![](https://github.com/XingGaoY/Slab_Allocator_for_ucore/Review%20and%20Summary/img/slab_page.png)
   Each buffer serves as its own bufctl while on the freelist. Only the linkeage is actually needed, since everything else is computable.
 
   The freelist linkage resides at the end of the buffer.
