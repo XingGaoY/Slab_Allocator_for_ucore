@@ -6,8 +6,16 @@
 
 ## Finished Work
 * The first three labs
-* Review of Bonwick's paper and some linux implementation
-* Finished the create part of slab and debugging
+* Review of Bonwick's paper and some linux implementation, 
+I check and add the comment of linux 2.6 kernel to make sure 
+understand it throughly.
+* Finished the create part of slab and debugging.  
+
+~~Questions~~
+* where should I put my cache_align macro, I temporarily put 
+it in the lib folder as linux did.
+* CONFIG_CACHE_SHIFT should be determined by hardware, how to? 
+I find little material on howto write defconfig
 
 ## Previous Slab
 Just an allocator for objects smaller than one page or
@@ -20,6 +28,9 @@ No reaping mechanism, if memory is used up, the allocator has no way
 to destroy slabs.
 
 ## Need to Do
+* I devide slab into two parts to implement: create and destroy, 
+and continue to the latter after ensure the create part is well.
+
 * Because a lot of functions are using kmalloc and kfree. If I 
 want to merge my slab to master tree, I need to test carefully 
 in order not to cause any future troubles.
