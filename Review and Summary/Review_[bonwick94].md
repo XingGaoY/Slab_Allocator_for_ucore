@@ -63,13 +63,16 @@ Here, the paper mentioned to observations:
 
 ### Slab Allocator Implementation
 
+![slab_layout](https://raw.github.com/XingGaoY/Slab_Allocator_for_ucore/master/Review%20and%20Summary/img/slab_layout.png)
+
 #### Caches
 
 Each cache has a front and back end:
+
 ![cache](https://raw.github.com/XingGaoY/Slab_Allocator_for_ucore/master/Review%20and%20Summary/img/cache.png)
 
 * The front end is the public interface to the allocator, which moves objects in and out
-* The back end manages the flow of real memory through the cache. ** Note that all back-end activity is triggered solely by memory presure **  
+* The back end manages the flow of real memory through the cache. **Note that all back-end activity is triggered solely by memory presure.**  
   Each cache maintains its own statistics - total allocations, number of allocated and freed buffers, etc. They indicate which part of system consume the most memory and help to indentify memory leaks.  
   They also indicate the activity level in various subsystems, to the extent that allocator traffic is an accurate approximation.
 
@@ -92,7 +95,7 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
 
   ##### Slab Layout for Small Objects
 
-  For objects smaller than 1\/8 page, a slab is built by allocating a page, placing the slab data at the end and dividing the rest into equal-size buffers:
+  For objects smaller than 1\8 page, a slab is built by allocating a page, placing the slab data at the end and dividing the rest into equal-size buffers:
   ![page](https://raw.github.com/XingGaoY/Slab_Allocator_for_ucore/master/Review%20and%20Summary/img/slab_page.png)
 
   Each buffer serves as its own bufctl while on the freelist. Only the linkeage is actually needed, since everything else is computable.
@@ -105,7 +108,7 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
 
   ##### Freelist Management
 
-  **Each cache maintains a circular, doubly-linked list of all its ** **~~slabs~~**. The slab list is partially sorted, empty slabs comes the first, followed by the partial slabs, and finally the complete slabs.
+  **Each cache maintains a circular, doubly-linked list of all its ~~slabs~~**. The slab list is partially sorted, empty slabs comes the first, followed by the partial slabs, and finally the complete slabs.
 
   The cache's freelist pointer points to its first non-empty slab.
 
@@ -118,5 +121,11 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
   When `kmem_cache_free` sees that the slab reference count is zero, it moves the slab to the tail of the freelist where all the complete slabs reside.
 
   When more memory is needed, the system asks the allocator to liberate as much memory as it can. **The allocator obliges, but retains a 15 second working set of recently-used slabs to prevent thrashing**.
+### Hardware Cache Ultilization
+For some middle size object aligned a buffer, i.e. 512KB, the first part of the cache may be heavily used, while the rest stays unused. which always happens power-of-2 allocators.  
+And for the machine with several main buses, causing heavily used of a little part of buses.
 
+The Slab incorporates a **coloring scheme** to avoid that, lead to **excellent cache ultilization and bus balance**
 
+Each time a new slab is created, the buffer addresses start at a slightly different offset (color) from the slab base
+(which is always page-aligned). Thus the middle sized objects are uniformly distributed in the cache.
