@@ -1,5 +1,3 @@
-[TOC]
-
 # Paper Review: The Slab Allocator: An Object-Caching Kernel Allocator.
 
 ---
@@ -96,6 +94,7 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
 
   For objects smaller than 1\/8 page, a slab is built by allocating a page, placing the slab data at the end and dividing the rest into equal-size buffers:
   ![page](https://raw.github.com/XingGaoY/Slab_Allocator_for_ucore/master/Review%20and%20Summary/img/slab_page.png)
+
   Each buffer serves as its own bufctl while on the freelist. Only the linkeage is actually needed, since everything else is computable.
 
   The freelist linkage resides at the end of the buffer.
@@ -106,7 +105,7 @@ The slab is the primary unit in the allocator. The allocator acquires or reclaim
 
   ##### Freelist Management
 
-  **Each cache maintains a circular, doubly-linked list of all its ****~~slabs~~**. The slab list is partially sorted, empty slabs comes the first, followed by the partial slabs, and finally the complete slabs.
+  **Each cache maintains a circular, doubly-linked list of all its ** **~~slabs~~**. The slab list is partially sorted, empty slabs comes the first, followed by the partial slabs, and finally the complete slabs.
 
   The cache's freelist pointer points to its first non-empty slab.
 
