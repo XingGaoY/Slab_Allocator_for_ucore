@@ -1,88 +1,306 @@
 #include <types.h>
 #include <list.h>
-#include <spinlock.h>
-#include <kio.h>
-#include <string.h>
-#include <mmu.h>
-#include <sem.h>
-#include <cache.h>
+#include <memlayout.h>
+#include <assert.h>
+#include <slab.h>
 #include <sync.h>
-#include <compiler.h>
+#include <pmm.h>
+#include <stdio.h>
+#include <rb_tree.h>
+#include <kio.h>
+#include <mp.h>
+#include <spinlock.h>
 
-#define info 0;
+/* The slab allocator used in ucore is based on an algorithm first introduced by 
+   Jeff Bonwick for the SunOS operating system. The paper can be download from 
+   http://citeseer.ist.psu.edu/bonwick94slab.html 
+   An implementation of the Slab Allocator as described in outline in;
+      UNIX Internals: The New Frontiers by Uresh Vahalia
+      Pub: Prentice Hall      ISBN 0-13-101908-2
+   Within a kernel, a considerable amount of memory is allocated for a finite set 
+   of objects such as file descriptors and other common structures. Jeff found that
+   the amount of time required to initialize a regular object in the kernel exceeded
+   the amount of time required to allocate and deallocate it. His conclusion was 
+   that instead of freeing the memory back to a global pool, he would have the memory
+   remain initialized for its intended purpose.
+   In our simple slab implementation, the the high-level organization of the slab 
+   structures is simplied. At the highest level is an array slab_cache[SLAB_CACHE_NUM],
+   and each array element is a slab_cache which has slab chains. Each slab_cache has 
+   two list, one list chains the full allocated slab, and another list chains the notfull 
+   allocated(maybe empty) slab.  And  each slab has fixed number(2^n) of pages. In each 
+   slab, there are a lot of objects (such as ) with same fixed size(32B ~ 128KB). 
+   
+   +----------------------------------+
+   | slab_cache[0] for 0~32B obj      |
+   +----------------------------------+
+   | slab_cache[1] for 33B~64B obj    |-->lists for slabs
+   +----------------------------------+            |  
+   | slab_cache[2] for 65B~128B obj   |            |            
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~            |                 
+   +----------------------------------+            |
+   | slab_cache[12]for 64KB~128KB obj |            |                    
+   +----------------------------------+            |
+                                                   |
+     slabs_full/slabs_not    +---------------------+
+   -<-----------<----------<-+
+   |           |         |
+  slab1       slab2     slab3...
+   |
+   |-------|-------|
+  pages1  pages2   pages3...
+   |
+   |
+   |
+   slab_t+n*bufctl_t+obj1-obj2-obj3...objn  (the size of obj is small)
+   |
+   OR
+   |
+   obj1-obj2-obj3...objn  WITH slab_t+n*bufctl_t in another slab (the size of obj is BIG)
 
-#define CACHE_NAMELEN 10;       //TODO object name length
-#define BYTE_PER_WORD sizeof(void*);
-#define MAX_ORDER 11;           //different with the def in buddy_pmm.c, consistent with linux4.8, TODO TEST: maybe result the same.
-#define MAX_GFP_ORDER 5;        //max size of pages 2^~ in a slab
-#define CFLGS_OFF_SLAB          //TODO def flags
-#define SLAB_LIMIT      0xFFFFFFFEL	// the max value of obj number
-#define BUFCTL_END 				//TODO end marker of a slabbuf_ctl
-
-typedef uint32_t kmem_bufctl_t;
-
-//global vals, calculate when slab init
-uint32_t offslab_limit;    
-uint32_t slab_break_gfp_order;
-semaphore_t cache_chain_sem;
-/*
-------------------------
-Two main type of object in slab;
-* kmem_cache_s: defines a cache desciptor to manage some slabs of a same object;
-* slab_s: manage the objects in a slab;
-------------------------
+   The important functions are:
+     kmem_cache_grow(kmem_cache_t *cachep)
+     kmem_slab_destroy(kmem_cache_t *cachep, slab_t *slabp)
+     kmalloc(size_t size): used by outside functions need dynamicly get memory
+     kfree(void *objp): used by outside functions need dynamicly release memory
 */
-typedef struct kmem_cache_s{
-    list_entry_t slabs_full;
-    list_entry_t slabs_partial;
-    //struct list_entry slabs_free;
-    size_t objsize;         //The size of each object in the slab
-    size_t flags;           //determines how the allocator behaves
-    size_t num;             //num of objects contained i each slab
-    spinlock_s spinlock;
 
-    //&gfp parameters
-    uint32_t gfporder;      //indicates the 2^order pages size of the slab
-    uint32_t gfpflags;      //flags for calling buddy system
+#define BUFCTL_END      0xFFFFFFFFL	// the signature of the last bufctl
+#define SLAB_LIMIT      0xFFFFFFFEL	// the max value of obj number
 
-    //color scheme
-    size_t colour;	    //number of different offset can use
-    uint32_t colour_off;	    //multiple to offset each object in the slab
-    uint32_t colour_next;   //the next colour line to use, wrap back to 0 when reach colour
-    uint32_t dflags;	    //flags modified during its lifetime							
-	uint32_t growing;		//indicate it is growing to make it less likely to be eliminated
+typedef size_t kmem_bufctl_t;	//the index of obj in slab
 
-    kmem_cache_t *slabp_cache;  //if slab_desp is off_slab, it will be saved here;
+typedef struct slab_s {
+	list_entry_t slab_link;	// the list entry linked to kmem_cache list
+	void *s_mem;		// the kernel virtual address of the first obj in slab 
+	size_t inuse;		// the number of allocated objs
+	size_t offset;		// the first obj's offset value in slab
+	kmem_bufctl_t free;	// the first free obj's index in slab  
+} slab_t;
 
-    //constructor and destructor, may be NULL
-    void(*ctor)(void*, kmem_cache_t *,uint32_t);
-    void(*dtor)(void*, kmem_cache_t *,uint32_t);
-
-    char name[CACHE_NAMELEN];   //human readabl object name
-    
-    list_entry_t next;     //the next cache in the cache chain;
-}kmem_cache_t;
-
-typedef struct slab_s{
-    list_entry_t    list;     //the linked list the slab belongs to, slab_full or slabs_partial;
-    uint32_t 	    colouroff;//color offset from the base addr of the 1st obj in the slab
-    void            *s_mem;   //the starting address of the first object within the slab.
-    uint32_t        inuse;    //the number of active objects in the slab
-    kmem_bufctl_t   free;     //the first free object in the slab.
-}slab_t;
-
-typedef struct cache_sizes{
-	size_t 		cs_size;
-	kmem_cache_t   *cs_cachep;
-	//kmem_cache_t   *cs_dmacachep
-}cache_sizes_t;
-//get the beginning of the kmem_bufctl_t array
-#define slab_bufctl(slabp)					 \
-	((kmem_bufctl_t *)(((slab_t*)slabp)+1))
 // get the slab address according to the link element (see list.h)
-#define le2cache(le, member)                 \
-    to_struct((le), kmem_cache_t, member)
-//set the info in page, which cache or page it belongs to 
+#define le2slab(le, member)                 \
+    to_struct((le), slab_t, member)
+
+typedef struct kmem_cache_s kmem_cache_t;
+
+struct kmem_cache_s {
+	list_entry_t slabs_full;	// list for fully allocated slabs
+	list_entry_t slabs_notfull;	// list for not-fully allocated slabs
+
+	size_t objsize;		// the fixed size of obj
+	size_t num;		// number of objs per slab
+	size_t offset;		// this first obj's offset in slab 
+	bool off_slab;		// the control part of slab in slab or not.
+
+	/* order of pages per slab (2^n) */
+	size_t page_order;
+
+	kmem_cache_t *slab_cachep;
+
+	/* spinlock to protect a kmem_cache,
+	 * XXX contention when multicore parallel 
+	 * allocating/freeing objects of the same size
+	 */
+	/* xv6 use lock-free linked list to implement free_list,
+	 * but may suffer from ABA race problem
+	 */
+	spinlock_s lock;
+};
+
+#define MIN_SIZE_ORDER          5	// 32
+#define MAX_SIZE_ORDER          17	// 128k
+#define SLAB_CACHE_NUM          (MAX_SIZE_ORDER - MIN_SIZE_ORDER + 1)
+
+static kmem_cache_t slab_cache[SLAB_CACHE_NUM];
+
+static void init_kmem_cache(kmem_cache_t * cachep, size_t objsize,
+			    size_t align);
+static void check_slab(void);
+
+//slab_init - call init_kmem_cache function to reset the slab_cache array
+void slab_init(void)
+{
+	size_t i;
+	//the align bit for obj in slab. 2^n could be better for performance
+	size_t align = 16;
+	for (i = 0; i < SLAB_CACHE_NUM; i++) {
+		init_kmem_cache(slab_cache + i, 1 << (i + MIN_SIZE_ORDER),
+				align);
+	}
+	check_slab();
+}
+
+//slab_allocated - summary the total size of allocated objs
+size_t slab_allocated(void)
+{
+	size_t total = 0;
+	int i;
+	bool intr_flag;
+	local_intr_save(intr_flag);
+	{
+		for (i = 0; i < SLAB_CACHE_NUM; i++) {
+			kmem_cache_t *cachep = slab_cache + i;
+			list_entry_t *list, *le;
+			list = le = &(cachep->slabs_full);
+			while ((le = list_next(le)) != list) {
+				total += cachep->num * cachep->objsize;
+			}
+			list = le = &(cachep->slabs_notfull);
+			while ((le = list_next(le)) != list) {
+				slab_t *slabp = le2slab(le, slab_link);
+				total += slabp->inuse * cachep->objsize;
+			}
+		}
+	}
+	local_intr_restore(intr_flag);
+	return total;
+}
+
+// slab_mgmt_size - get the size of slab control area (slab_t+num*kmem_bufctl_t)
+static size_t slab_mgmt_size(size_t num, size_t align)
+{
+	return ROUNDUP(sizeof(slab_t) + num * sizeof(kmem_bufctl_t), align);
+}
+
+// cacahe_estimate - estimate the number of objs in a slab
+static void
+cache_estimate(size_t order, size_t objsize, size_t align, bool off_slab,
+	       size_t * remainder, size_t * num)
+{
+	size_t nr_objs, mgmt_size;
+	size_t slab_size = (PGSIZE << order);
+
+	if (off_slab) {
+		mgmt_size = 0;
+		nr_objs = slab_size / objsize;
+		if (nr_objs > SLAB_LIMIT) {
+			nr_objs = SLAB_LIMIT;
+		}
+	} else {
+		nr_objs =
+		    (slab_size - sizeof(slab_t)) / (objsize +
+						    sizeof(kmem_bufctl_t));
+		while (slab_mgmt_size(nr_objs, align) + nr_objs * objsize >
+		       slab_size) {
+			nr_objs--;
+		}
+		if (nr_objs > SLAB_LIMIT) {
+			nr_objs = SLAB_LIMIT;
+		}
+		mgmt_size = slab_mgmt_size(nr_objs, align);
+	}
+	*num = nr_objs;
+	*remainder = slab_size - nr_objs * objsize - mgmt_size;
+}
+
+// calculate_slab_order - estimate the size(4K~4M) of slab
+// paramemters:
+//   cachep:    the slab_cache
+//   objsize:   the size of obj
+//   align:     align bit for objs
+//   off_slab:  the control part of slab in slab or not
+//   left_over: the size of can not be used area in slab
+static void
+calculate_slab_order(kmem_cache_t * cachep, size_t objsize, size_t align,
+		     bool off_slab, size_t * left_over)
+{
+	size_t order;
+	for (order = 0; order <= KMALLOC_MAX_ORDER; order++) {
+		size_t num, remainder;
+		cache_estimate(order, objsize, align, off_slab, &remainder,
+			       &num);
+		if (num != 0) {
+			if (off_slab) {
+				size_t off_slab_limit =
+				    objsize - sizeof(slab_t);
+				off_slab_limit /= sizeof(kmem_bufctl_t);
+				if (num > off_slab_limit) {
+					panic("off_slab: objsize = %d, num = %d.",
+					     objsize, num);
+				}
+			}
+			if (remainder * 8 <= (PGSIZE << order)) {
+				cachep->num = num;
+				cachep->page_order = order;
+				if (left_over != NULL) {
+					*left_over = remainder;
+				}
+				return;
+			}
+		}
+	}
+	panic("calculate_slab_over: failed.");
+}
+
+// getorder - find order, should satisfy n <= minest 2^order
+static inline size_t getorder(size_t n)
+{
+	size_t order = MIN_SIZE_ORDER, order_size = (1 << order);
+	for (; order <= MAX_SIZE_ORDER; order++, order_size <<= 1) {
+		if (n <= order_size) {
+			return order;
+		}
+	}
+	panic("getorder failed. %d\n", n);
+}
+
+// init_kmem_cache - initial a slab_cache cachep according to the obj with the size = objsize
+static void init_kmem_cache(kmem_cache_t * cachep, size_t objsize, size_t align)
+{
+	list_init(&(cachep->slabs_full));
+	list_init(&(cachep->slabs_notfull));
+	spinlock_init(&cachep->lock);
+
+	objsize = ROUNDUP(objsize, align);
+	cachep->objsize = objsize;
+	cachep->off_slab = (objsize >= (PGSIZE >> 3));
+
+	size_t left_over;
+	calculate_slab_order(cachep, objsize, align, cachep->off_slab,
+			     &left_over);
+
+	assert(cachep->num > 0);
+
+	size_t mgmt_size = slab_mgmt_size(cachep->num, align);
+
+	if (cachep->off_slab && left_over >= mgmt_size) {
+		cachep->off_slab = 0;
+	}
+
+	if (cachep->off_slab) {
+		cachep->offset = 0;
+		cachep->slab_cachep =
+		    slab_cache + (getorder(mgmt_size) - MIN_SIZE_ORDER);
+	} else {
+		cachep->offset = mgmt_size;
+	}
+}
+
+static void *kmem_cache_alloc(kmem_cache_t * cachep);
+
+#define slab_bufctl(slabp)              \
+    ((kmem_bufctl_t*)(((slab_t *)(slabp)) + 1))
+
+// kmem_cache_slabmgmt - get the address of a slab according to page
+//                     - and initialize the slab according to cachep
+static slab_t *kmem_cache_slabmgmt(kmem_cache_t * cachep, struct Page *page)
+{
+	void *objp = page2kva(page);
+	slab_t *slabp;
+
+	if (cachep->off_slab) {
+		if ((slabp = kmem_cache_alloc(cachep->slab_cachep)) == NULL) {
+			return NULL;
+		}
+	} else {
+		slabp = page2kva(page);
+	}
+	slabp->inuse = 0;
+	slabp->offset = cachep->offset;
+	slabp->s_mem = objp + cachep->offset;
+	return slabp;
+}
+
 #define SET_PAGE_CACHE(page, cachep)                                                \
     do {                                                                            \
         struct Page *__page = (struct Page *)(page);                                \
@@ -97,448 +315,349 @@ typedef struct cache_sizes{
         *__cachepp = (slab_t *)(slabp);                                             \
     } while (0)
 
-
-//the cache of the cache(really awesome, how could i forget this)
-static kmem_cache_t cache_cache = {
-slabs_full:     list_init(cache_cache.slabs_full),
-slab_partial:   list_init(cache_cache.slabs_partial),
-//slab_free:    list_init(cache_cache.slabs_free),
-objsize:        sizeof(kmem_cache_t),
-flags:          SLAB_NO_REAP,
-spinlock:       {0},
-name:           "kmem_cache"
-};
-
-static cache_sizes_t cache_sizes[] = {
-	{    32, NULL},
-	{    64, NULL},
-	{   128, NULL},
-	{   256, NULL},
-	{   512, NULL},
-	{  1024, NULL},
-	{  2048, NULL},
-	{  4096, NULL},
-	{  8192, NULL},
-	{ 16384, NULL},
-	{ 32768, NULL},
-	{ 65536, NULL},
-	{131072, NULL},
-	{     0, NULL}
-};
-
-
-void kmem_cache_init_objs(kmem_cache_t *cachep, slab_t *slabp, uint32_t ctor_flags);
-
-
-/*   
------------------------------------------------------------
-			Section on CACHE
------------------------------------------------------------
-*/
-
-
-//XXX cannot figure out what the original code did,roundup seems a waste of time
-/*kmem_cache_estimate--Determine how many obj will be put in a slab, and the space left unused.
- *@gfporder: indicate the order of the pages in a slab
- *@size: size of the object
- *@flags: flags of the cache
- *@left_over: the number of bytes left in the slab, meant to be returned.
- *@num: the number of obj can be put in the slab, meant to be returned.
- */
-static void kmem_cache_estimate(uint32_t gfporder, size_t size,
-        int flags, size_t *left_over, uit32_t *num)
+// kmem_cache_grow - allocate a new slab by calling alloc_pages
+//                 - set control area in the new slab
+static bool kmem_cache_grow(kmem_cache_t * cachep)
 {
-	int i=0;
-
-	size_t wastage = PAGE_SIZE<<gfporder;
-	size_t base = 0;
-	size_t extra = 0;
-	
-	if(!(flags & CFLGS_OFF_SLAB)){
-		base = sizeof(slab_t);
-		extra = sizeof(kmem_bufctl_t);
-	}
-	//obj_num is the num of objs, solve the equation $i*size + base + i*extra <= wastage$
-	while(i*size + L1_CACHE_ALIGN(base+i*extra) <= wastage)
-		i++;
-	if(i > 0)
-		i--;
-	if(i > SLAB_LIMIT)
-		i = SLAB_LIMIT;
-
-	*num = i;
-	wastage -= i*size;
-	wastage -= L1_CACHE_ALIGN(base+i*extra);
-	*left_over = wastage;
-}
-
-void kmem_cache_free(kmem_cache_t *cachep, void *objp);
-kmem_cache_t * kmem_find_general_cachep(size_t size, int gfpflags);
-//Not defined in the original virsion, for caches are already organized as an array. 
-/*kmem_cache_create--create a new cache, and check some para
- *@name: human readable name of a object(cache)
- *@size: the size of the object
- *@flags: cache flags
- *@ctor& dtor: constructor and destructor of the objects, can be left NULL
- */
-kmem_cache_t * kmem_cache_create(const char* name, size_t size, 
-        size_t offset, size_t flags,
-        void (*ctor)(void*, kmem_cache_t *, uint32_t),
-        void (*dtor)(void*, kmem_cache_t *, uint32_t))
-{
-    const char* bug_location = KERN_ERR "kmem_create: ";
-    size_t left_over, align, slab_size;
-    
-    kmem_cache_t *cachep = NULL;    //TODO
-    
-    /*check usage bugs
-     */
-    if((!name)||
-       ((strlen(name) >= CACHE_NAMELEN -1)) ||
-       //((in_interrupt()||
-       (size < BYTES_PER_WORD) ||
-       (size > (1<<MAX_ORDER)*PGSIZE) ||
-       (dtor && !ctor) ||
-       (offset < 0 || offset > size))
-        BUG(bug_location,"bad parameter usage");
-    
-    cachep = (kmem_cache_t *)kmem_cache_alloc(&cache_cache, SLAB_KERNEL);
-    //simply allocate a new cache TODO kmem_cache_alloc 
-    if(!cachep)
-        goto opps;
-    memset(cachep, 0, sizeof(kmem_cache_t));    //TODO shouldbe put in kmem_cache_alloc?
-    
-    //aligns the object ro the wordsize
-    if(size & (BYTES_PER_WORD-1)){
-        size += (BYTES_PER_WORD-1);
-        size &= ~(BYTES_PER_WORD-1);
-#if info
-        kprintf("SLAB CACHE CREATE: Forcing Alignment--%s\n", name);
-#endif
-    }
-
-
-    //determine the value of align
-    align = BYTES_PER_WORD;
-    //if requested aligns the obj to the L1 CPU cache
-    if(flags & SLAB_HWCACHE_ALIGN)
-	align = L1_CACHE_BYTES;
-    //keep slab_t offslab when too large object
-    if(size >= (PGSIZE>>3))
-        flags |= CFLGS_OFF_SLAB;
-    //TODO Comments needed here
-	if(flags & SLAB_HWCACHE_ALIGN){
-		while (size < align / 2)
-	    	align /= 2;
-		size = (size+align-1)&(~(align-1));
-    }
-
-    //calculate num of objects in a slab and adjust the size of a slab
-    do{
-        uint32_t break_flag = 0;
-cal_wastage:
-        kmem_cache_estimate(cachep->gfporder, size, flags, &left_over, &cachep->num);
-        //set if the num of objs fitting on the slab exceeds the num that can be kept in the slab when offslab descrp are used
-        if(break_flag)
-            break;
-        //the order size of pages in a slab must not be exceeded
-        if(cachep->gfporder >= MAX_GFP_ORDER)
-            break;
-        //TODO not understand
-        if(!cachep->num)
-            goto next;
-        //if offslab, but num of obj 
-        if(flags & CFLGS_OFF_SLAB && cachep->num > offslab_limit){
-            cachep->gfporder--;
-            break_flag++;
-            goto cal_wastage;
-        }
-        //TODO nt understand
-        if(cachep->gfporder >= slab_break_gfp_order)
-            break;
-        //make sure slab left_over is less than 1/8 of a slab
-        if((left_over*8) <= (PGSIZE<<cachep->gfporder))
-            break;
-        //if internal fragment is too high, increase slab size and recalculate
-next:
-        cachep->gfporder++;
-    }while(1);
-
-    //after recalculate, if the object isstill not fit, error
-    if(!cachep->num){
-        kprintf("kmem_cache_create: could not create cache %s.\n", name);
-        kmem_cache_free(&cache_cache, cachep);
-        cachep = NULL;
-        goto opps;
-    }
-    //calculate slab_size, align to L1 cache
-    slab_size = L1_CACHE_ALIGN(cachep->num * sizeof(kmem_bufctl_t) + sizeof(slab_t));
-    //if enough space left for slab descriptor, move it into slab and update flags and slab leftover
-    if(flags & CFLGS_OFF_SLAB && left_over >= slab_size){
-        flags &= ~CFLGS_OFF_SLAB;
-        left_over -= slab_size;
-    }
-	
-	//calculate colour offsets
-	offset += (align-1);
-	offset &= ~(align -1);
-	if(!offset)
-		offset = L1_CACHE_BYTES;
-	cachep->colour_off = offset;
-	cachep->colour = left_over/offset;
-
-    cachep->flags = flags;
-    cachep->gfpflags = 0;
-    spinlock_init(&cache->spinlock);
-    cachep->objsize = size;
-
-    list_init(&cachep->slabs_full);
-    list_init(&cachep->slabs_partial);
-
-    //if off slab, slab will be put in a slab cache
-    if(flags & CFLGS_OFF_SLAB)
-        cachep->slabp_cache = kmem_find_general_cachep(slab_size, 0);
-
-    cachep->ctor = ctor;
-    cachep->dtor = dtor;
-    strcpy(cachep->nme, name);
-    
-    //loop the list to ensure no existed cache has the same name with it
-    down(&cache_chain_sem);
-    {
-        struct list_entry_t *p;
-        p = cache_chain->next;
-        while(p != cache_chain){
-            if(!strcmp(le2cache(p, next)->name,name))
-                BUG(bug_location, "Cache cannot be created--same cache name");
-        }
-    }
-
-    list_add(&cache_chain, &cachep->next);
-    up(&cache_chain_sem);
-opps:
-    return cachep;
-}
-
-/*-------------------------------------------------------------------------
- *			      Section on slab
- */------------------------------------------------------------------------
-
-//Function the same.
-//The original codes need less input, so some address mapping is essential
-/*kmem_cache_slabmgmt: either allocate space to keep the slab descriptor **off cache**
- * or reserve enough space at the beginning of the slab for the descriptor and bufctl **in the cache**
- * @cachep: the cache which slab allocated to
- * @objp: points to the **beginning of the slab**
- * @local_flags: flags for cache
- */
-static inline slab_t *kmem_cache_slabmgmt(kmem_cache_t *cachep, void *objp
-		uint32_t colour_off, int local_flags)
-{
-	slab_t *slabp;
-
-	//
-	if(OFF_SLAB(cachep)){
-		slabp = kmem_cache_alloc(cachep->slabp_cache, local_flags);
-		if(!slabp)
-			return NULL;
-	}
-	else{
-		slabp = objp+colour_off;
-		colour_off += L1_CACHE_ALIGN(cachep->num * sizeof(kmem_bufctl_t) +
-			sizeof(slab_t);		
-	}
-	slabp->inuse = 0;
-	slabp->colouroff = colour_off;
-	slabp->s_mem = objp+colour_off;
-
-	return slabp;
-}
-//Most important function in slab
-/*kmem_cache_grow: allocate memory, link pages for the slab, initialize obj in the slab and add slab to the cache 
- *@cachep: the cache above the slab
- *@flags: flags for slab
- */
-//TODO flags
-static int kmem_cache_grow(kmem_cache_t *cachep, int flags)
-{
-	int 		order;
-	uint32_t  	save_flags;
-	uint32_t 	ctor_flags;
-	slab_t   	*slabp;
-	size_t 		offset;
-
-	if(flags & SLAB_NO_GROW)
-		return 0;
-
-	ctor_flags = SLAB_CTOR_CONSTRUCTOR;
-	//aquire an int-safe lock for accessing the cache descriptor
-	spin_lock_irqsave(&cachep->spinlock, save_flags);
-	
-	offset = cachep->colour_next;
-	cachep->colour_next++;
-	if(cachep->colour_next >= cachep->colour)
-		cachep->colour_next = 0;
-	offset *= cachep->colour_off;
-	cachep->dflags |= DFLGS_GROWN;	//make the slab growing, avoiding to be reaped
-	
-	cachep->growing++;
-	spin_lock_irqrestore(&cachep->spinlock, save_flags);	
-
-	struct *Page objp = alloc_pages(1<<cachep->gfporder);
-	if(!objp)
+	bool intr_flag;
+	struct Page *page = alloc_pages(1 << cachep->page_order);
+	if (page == NULL) {
 		goto failed;
-	if(!(slabp = kmem_cache_slabmgmt(cachep, objp, flags)))
-		goto opps1;
+	}
 
-	//link the pages for the slab
-	order = 1 << cachep->gfporder;
-	do{
-               //setup this page in the free list (see memlayout.h: struct page)???
-               SET_PAGE_CACHE(page, cachep);
-               SET_PAGE_SLAB(page, slabp);
-               //this page is used for slab
-               SetPageSlab(page);
-               page = NEXT_PAGE(page);
-	}while(--order);
+	slab_t *slabp;
+	if ((slabp = kmem_cache_slabmgmt(cachep, page)) == NULL) {
+		goto oops;
+	}
 
-	kmem_cache_init_objs(cachep, slabp, ctor_flags);
+	size_t order_size = (1 << cachep->page_order);
+	do {
+		//setup this page in the free list (see memlayout.h: struct page)???
+		SET_PAGE_CACHE(page, cachep);
+		SET_PAGE_SLAB(page, slabp);
+		//this page is used for slab
+		SetPageSlab(page);
+		page = NEXT_PAGE(page);
+	} while (--order_size);
 
-	//initialize all objects
-	spin_lock_irqsave(&cachep->spinlock, save_flags);
-	cachep->growing--;		//TODO why?
+	int i;
+	for (i = 0; i < cachep->num; i++) {
+		slab_bufctl(slabp)[i] = i + 1;
+	}
+	slab_bufctl(slabp)[cachep->num - 1] = BUFCTL_END;
+	slabp->free = 0;
 
-	list_add_before(&cachep->slabs_partial, &slabp->list);
-	STATS_INC_GROWN(cachep);	//TODO not defined
-	
-	spin_lock_irqrestore(&cachep->spinlock, save_flags);
-	
+	local_intr_save(intr_flag);
+	spinlock_acquire(&cachep->lock);
+	list_add(&(cachep->slabs_notfull), &(slabp->slab_link));
+	spinlock_release(&cachep->lock);
+	local_intr_restore(intr_flag);
 	return 1;
 
-opps1:
-	kmem_freepages(cachep,  objp);
+oops:
+	free_pages(page, 1 << cachep->page_order);
 failed:
-	spin_lock_irqsave(&cachep->spinlock, save_flags);
-	cachep->growing--;
-	spin_lock_irqrestore(&cachep->spinlock, save_flags);
 	return 0;
 }
 
-/*kmem_find_general_cachep: **off slab**, find the appropriate size cache to use and will be  
- *@size: the size of the slab descriptor
-*/
-kmem_cache_t *kmem_find_general_cachep(size_t size){
-	cache_size_t *csizep = cache_sizes;
-
-	for(; csizep->cs_size; csizep++){
-		if(size > csizep->cs_size)
-			continue;
-		break;
-	}
-	return csizep->cs_cachep;
-}
-//----------------------------------------------
-//					obj section
-//----------------------------------------------
-
-/*kmem_cache_init_objs: initiate all the objs in a slab
- *@cachep: the obj needed to init in
- *@slabp: same as above
- *@ctor_flags: TODO 
- */
-static inline void kmem_cache_init_objs(kmem_cache_t *cachep,
-		slab_t *slabp, uint32_t ctor_flags)
+// kmem_cache_alloc_one - allocate a obj in a slab
+// Precondition: lock acquried
+static void *__kmem_cache_alloc_one(kmem_cache_t * cachep, slab_t * slabp)
 {
-	int i;
-	for(i = 0;	i < cachep->num; i++){
-	//count the addr of the obj
-	void* obj = slabp->s_mem+cachep->objsize*i;
-
-	//call the constructor if available
-	if(cachep->ctor)
-		cachep->ctor(objp, cachep, ctor_flags);
-
-	slab_bufctl(slabp)[i] = i+1;
-	}
-
-	slab_bufctl[i-1] = BUFCTL_END;
-	slabp->free = 0;
-}
-/* kmem_cache_alloc_one_tail: allocate one obj from a slab
- * @cachep: the cache obj alloc from
- * @slabp: the slab obj alloc from
- */
-static inline void *kmem_cache_alloc_one_tail(kmem_cache_t *cachep,
-			slab_t *slabp)
-{
-	void* objp;
-	
-	//set objp point to the first free obj in the slab
-	//update the new num of used obj(free)
 	slabp->inuse++;
-	objp = slabp->s_mem + slabp->free*cachep->objsize;
+	void *objp = slabp->s_mem + slabp->free * cachep->objsize;
 	slabp->free = slab_bufctl(slabp)[slabp->free];
 
-	//if free exceeds the end mark, move it from the partial list to the full
-	if(unlikely(slabp->free == BUFCTL_END)){
-		list_del(&slabp->list);
-		list_add(&cachep->slabs_full, &slabp->list);
+	if (slabp->free == BUFCTL_END) {
+		list_del(&(slabp->slab_link));
+		list_add(&(cachep->slabs_full), &(slabp->slab_link));
 	}
 	return objp;
 }
 
-/* kmem_cache_alloc_one: alloc a new slab from the list, 
- *  defined as a macro rather a inline function
- * @cachep: the cache slab allocate from
- */
-#define kmem_cache_alloc_one(cachep)			\
-({												\
-	struct list_head *slabs_partial, *entry;	\
- 	slab_t *slabp;								\
-												\
- 	slabs_partial = &(cachep)->slabs_partial;	\
- 	entry = slabs_partial->next;				\
- 	if(unlikely(entry == slabs_partial)){		\
- 		struct list_head *slabs_free;			\
- 		slabs_free = &(cachep)->slabs_free;		\
- 		entry = slabs_free->next;				\
-		if(unlikely(entry == slabs_free))		\
- 			goto alloc_new_slab;				\
- 		list_del(entry);						\
- 		list_add(slabs_partial, entry);			\
- 	}											\
-												\
- 	slabp = list_str(entry, slab_t, list);		\
- 	kmem_cache_alloc_one_tail(cachep, slabp);	\
-})
-/*__kmem_cache_alloc: main function to alloc object
- *@cachep: cache to allocate from
- *flags: flags need to specify
- */
-//TODO here is somehow really a mess
-static inline void *__kmem_cache_alloc(kmem_cache_t *cachep, uint32_t flags)
+// kmem_cache_alloc - call __kmem_cache_alloc_one function to allocate a obj
+//                  - if no free obj, try to allocate a slab
+static void *kmem_cache_alloc(kmem_cache_t * cachep)
 {
-	uint32_t save_flags;
-	void* objp;
-
-	//XXX for dma use check
-	//kmem_cache_alloc_head(cachep, flags);
+	void *objp;
+	bool intr_flag;
 
 try_again:
-	local_intr_save(save_flags);	//disable interrupt and save flags
-
-	objp = kmem_cache_alloc_one(cachep);
-
-	local_intr_restore(save_flags);
+	local_intr_save(intr_flag);
+	spinlock_acquire(&cachep->lock);
+	if (list_empty(&(cachep->slabs_notfull))) {
+		goto alloc_new_slab;
+	}
+	slab_t *slabp = le2slab(list_next(&(cachep->slabs_notfull)), slab_link);
+	objp = __kmem_cache_alloc_one(cachep, slabp);
+	spinlock_release(&cachep->lock);
+	local_intr_restore(intr_flag);
 	return objp;
-alloc_new_slab:
 
-	local_irq_restore(save_flags);
-	if(kmem_cache_grow(cachep, flags)
-			goto try_again;
+alloc_new_slab:
+	spinlock_release(&cachep->lock);
+	local_intr_restore(intr_flag);
+	if (kmem_cache_grow(cachep)) {
+		goto try_again;
+	}
 	return NULL;
 }
-void BUG(char* bug_location, char* bug_info){
-    kprintf("%s:%s\n", bug_location, bug_info);
-    assert(0);
+
+// kmalloc - simple interface used by outside functions 
+//         - to allocate a free memory using kmem_cache_alloc function
+void *kmalloc(size_t size)
+{
+	assert(size > 0);
+	size_t order = getorder(size);
+	if (order > MAX_SIZE_ORDER) {
+		return NULL;
+	}
+	return kmem_cache_alloc(slab_cache + (order - MIN_SIZE_ORDER));
+}
+
+static void kmem_cache_free(kmem_cache_t * cachep, void *obj);
+
+// kmem_slab_destroy - call free_pages & kmem_cache_free to free a slab 
+static void kmem_slab_destroy(kmem_cache_t * cachep, slab_t * slabp)
+{
+	struct Page *page = kva2page(slabp->s_mem - slabp->offset);
+
+	struct Page *p = page;
+	size_t order_size = (1 << cachep->page_order);
+	do {
+		assert(PageSlab(p));
+		ClearPageSlab(p);
+		p = NEXT_PAGE(p);
+	} while (--order_size);
+
+	free_pages(page, 1 << cachep->page_order);
+
+	if (cachep->off_slab) {
+		kmem_cache_free(cachep->slab_cachep, slabp);
+	}
+}
+
+// kmem_cache_free_one - free an obj in a slab
+//                     - if slab->inuse==0, then free the slab
+// lock held
+static void
+__kmem_cache_free_one(kmem_cache_t * cachep, slab_t * slabp, void *objp)
+{
+	//should not use divide operator ???
+	size_t objnr = (objp - slabp->s_mem) / cachep->objsize;
+	slab_bufctl(slabp)[objnr] = slabp->free;
+	slabp->free = objnr;
+
+	slabp->inuse--;
+
+	if (slabp->inuse == 0) {
+		list_del(&(slabp->slab_link));
+		kmem_slab_destroy(cachep, slabp);
+	} else if (slabp->inuse == cachep->num - 1) {
+		list_del(&(slabp->slab_link));
+		list_add(&(cachep->slabs_notfull), &(slabp->slab_link));
+	}
+}
+
+#define GET_PAGE_CACHE(page)                                \
+    (kmem_cache_t *)((page)->page_link.next)
+
+#define GET_PAGE_SLAB(page)                                 \
+    (slab_t *)((page)->page_link.prev)
+
+// kmem_cache_free - call kmem_cache_free_one function to free an obj 
+static void kmem_cache_free(kmem_cache_t * cachep, void *objp)
+{
+	bool intr_flag;
+	struct Page *page = kva2page(objp);
+
+	if (!PageSlab(page)) {
+		panic("not a slab page %08x\n", objp);
+	}
+	local_intr_save(intr_flag);
+	{
+		spinlock_acquire(&cachep->lock);
+		__kmem_cache_free_one(cachep, GET_PAGE_SLAB(page), objp);
+		spinlock_release(&cachep->lock);
+	}
+	local_intr_restore(intr_flag);
+}
+
+// kfree - simple interface used by ooutside functions to free an obj
+void kfree(void *objp)
+{
+	//Fix by chenyh
+	//according to Linux "If @objp is NULL, no operation is performed."
+	if (!objp)
+		return;
+	kmem_cache_free(GET_PAGE_CACHE(kva2page(objp)), objp);
+}
+
+static inline void check_slab_empty(void)
+{
+	int i;
+	for (i = 0; i < SLAB_CACHE_NUM; i++) {
+		kmem_cache_t *cachep = slab_cache + i;
+		assert(list_empty(&(cachep->slabs_full)));
+		assert(list_empty(&(cachep->slabs_notfull)));
+	}
+}
+
+void check_slab(void)
+{
+	int i;
+	void *v0, *v1;
+
+	size_t nr_used_pages_store = nr_used_pages();
+	size_t slab_allocated_store = slab_allocated();
+
+	/* slab must be empty now */
+	check_slab_empty();
+	assert(slab_allocated() == 0);
+
+	kmem_cache_t *cachep0, *cachep1;
+
+	cachep0 = slab_cache;
+	assert(cachep0->objsize == 32 && cachep0->num > 1
+	       && !cachep0->off_slab);
+	assert((v0 = kmalloc(16)) != NULL);
+
+	slab_t *slabp0, *slabp1;
+
+	assert(!list_empty(&(cachep0->slabs_notfull)));
+	slabp0 = le2slab(list_next(&(cachep0->slabs_notfull)), slab_link);
+	assert(slabp0->inuse == 1
+	       && list_next(&(slabp0->slab_link)) == &(cachep0->slabs_notfull));
+
+	struct Page *p0, *p1;
+	size_t order_size;
+
+	p0 = kva2page(slabp0->s_mem - slabp0->offset), p1 = p0;
+	order_size = (1 << cachep0->page_order);
+	for (i = 0; i < cachep0->page_order; i++, p1 = NEXT_PAGE(p1)) {
+		assert(PageSlab(p1));
+		assert(GET_PAGE_CACHE(p1) == cachep0
+		       && GET_PAGE_SLAB(p1) == slabp0);
+	}
+
+	assert(v0 == slabp0->s_mem);
+	assert((v1 = kmalloc(16)) != NULL && v1 == v0 + 32);
+
+	kfree(v0);
+	assert(slabp0->free == 0);
+	kfree(v1);
+	assert(list_empty(&(cachep0->slabs_notfull)));
+
+	for (i = 0; i < cachep0->page_order; i++, p0 = NEXT_PAGE(p0)) {
+		assert(!PageSlab(p0));
+	}
+
+	v0 = kmalloc(16);
+	assert(!list_empty(&(cachep0->slabs_notfull)));
+	slabp0 = le2slab(list_next(&(cachep0->slabs_notfull)), slab_link);
+
+	for (i = 0; i < cachep0->num - 1; i++) {
+		kmalloc(16);
+	}
+
+	assert(slabp0->inuse == cachep0->num);
+	assert(list_next(&(cachep0->slabs_full)) == &(slabp0->slab_link));
+	assert(list_empty(&(cachep0->slabs_notfull)));
+
+	v1 = kmalloc(16);
+	assert(!list_empty(&(cachep0->slabs_notfull)));
+	slabp1 = le2slab(list_next(&(cachep0->slabs_notfull)), slab_link);
+
+	kfree(v0);
+	assert(list_empty(&(cachep0->slabs_full)));
+	assert(list_next(&(slabp0->slab_link)) == &(slabp1->slab_link)
+	       || list_next(&(slabp1->slab_link)) == &(slabp0->slab_link));
+
+	kfree(v1);
+	assert(!list_empty(&(cachep0->slabs_notfull)));
+	assert(list_next(&(cachep0->slabs_notfull)) == &(slabp0->slab_link));
+	assert(list_next(&(slabp0->slab_link)) == &(cachep0->slabs_notfull));
+
+	v1 = kmalloc(16);
+	assert(v1 == v0);
+	assert(list_next(&(cachep0->slabs_full)) == &(slabp0->slab_link));
+	assert(list_empty(&(cachep0->slabs_notfull)));
+
+	for (i = 0; i < cachep0->num; i++) {
+		kfree(v1 + i * cachep0->objsize);
+	}
+
+	assert(list_empty(&(cachep0->slabs_full)));
+	assert(list_empty(&(cachep0->slabs_notfull)));
+
+	cachep0 = slab_cache;
+
+	bool has_off_slab = 0;
+	for (i = 0; i < SLAB_CACHE_NUM; i++, cachep0++) {
+		if (cachep0->off_slab) {
+			has_off_slab = 1;
+			cachep1 = cachep0->slab_cachep;
+			if (!cachep1->off_slab) {
+				break;
+			}
+		}
+	}
+
+	if (!has_off_slab) {
+		goto check_pass;
+	}
+
+	assert(cachep0->off_slab && !cachep1->off_slab);
+	assert(cachep1 < cachep0);
+
+	assert(list_empty(&(cachep0->slabs_full)));
+	assert(list_empty(&(cachep0->slabs_notfull)));
+
+	assert(list_empty(&(cachep1->slabs_full)));
+	assert(list_empty(&(cachep1->slabs_notfull)));
+
+	v0 = kmalloc(cachep0->objsize);
+	p0 = kva2page(v0);
+	assert(page2kva(p0) == v0);
+
+	if (cachep0->num == 1) {
+		assert(!list_empty(&(cachep0->slabs_full)));
+		slabp0 = le2slab(list_next(&(cachep0->slabs_full)), slab_link);
+	} else {
+		assert(!list_empty(&(cachep0->slabs_notfull)));
+		slabp0 =
+		    le2slab(list_next(&(cachep0->slabs_notfull)), slab_link);
+	}
+
+	assert(slabp0 != NULL);
+
+	if (cachep1->num == 1) {
+		assert(!list_empty(&(cachep1->slabs_full)));
+		slabp1 = le2slab(list_next(&(cachep1->slabs_full)), slab_link);
+	} else {
+		assert(!list_empty(&(cachep1->slabs_notfull)));
+		slabp1 =
+		    le2slab(list_next(&(cachep1->slabs_notfull)), slab_link);
+	}
+
+	assert(slabp1 != NULL);
+
+	order_size = (1 << cachep0->page_order);
+	for (i = 0; i < order_size; i++, p0 = NEXT_PAGE(p0)) {
+		assert(PageSlab(p0));
+		assert(GET_PAGE_CACHE(p0) == cachep0
+		       && GET_PAGE_SLAB(p0) == slabp0);
+	}
+
+	kfree(v0);
+
+check_pass:
+
+	check_rb_tree();
+	check_slab_empty();
+	assert(slab_allocated() == 0);
+	assert(nr_used_pages_store == nr_used_pages());
+	assert(slab_allocated_store == slab_allocated());
+
+	kprintf("check_slab() succeeded!\n");
 }
