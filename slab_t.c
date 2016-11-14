@@ -1,3 +1,4 @@
+//XXX WARNING: spinlock and interupt need carefully check here
 #include <pmm.h>
 #include <slab_t.h>
 #include <types.h>
@@ -157,7 +158,7 @@ static inline void kmem_freepages(kmem_cache_t* cachep, void* addr){
 		ClearPageSlab(page);
 		page++;
 	}
-	free_pages(kva2page(addr), cachep->gfporder);	
+	free_pages(kva2page(addr), 1<<cachep->gfporder);	
 }
 
 /*   
@@ -357,11 +358,11 @@ opps:
 /*__kmem_cache_shrink_locked: the main function to free slabs;
  * &cachep: the cache to free from
  */
-static int __kmem_cache_shrink_locked(kmem_cache_t *cachep)
+static int __kmem_cache_shrink_locked(kmem_cache_t *cachep, int flags)
 {
 	slab_t* slabp;
 	int ret = 0;
-	int flags;		//TODO won't be used here
+
 	while(!cachep->growing){
 		list_entry_t *p;
 		//get the last slab in the free list
@@ -372,7 +373,7 @@ static int __kmem_cache_shrink_locked(kmem_cache_t *cachep)
 		slabp = le2slab(cachep->slabs_free.prev, list);
 		list_del(&slabp->list);
 
-		spin_unlock_irqrestore(&cachep->spinlock, flags);	//TODO wrong here
+		spin_unlock_irqrestore(&cachep->spinlock, flags);	
 		kmem_slab_destroy(cachep, slabp);
 		ret++;
 		spin_lock_irqsave(&cachep->spinlock, flags);
@@ -386,9 +387,9 @@ static int __kmem_cache_shrink_locked(kmem_cache_t *cachep)
 static int __kmem_cache_shrink(kmem_cache_t* cachep)
 {
 	int ret;
-	int flags;//TODO not used	
-	spin_lock_irqsave(&cachep->spinlock, flags); //TODO something maybe wrong
-    __kmem_cache_shrink_locked(cachep);
+	int flags;
+	spin_lock_irqsave(&cachep->spinlock, flags); 
+    __kmem_cache_shrink_locked(cachep, flags);
 	//checks full and partial are empty
 	ret = (int)(!list_empty(&cachep->slabs_full) || !list_empty(&cachep->slabs_partial));
 	spin_unlock_irqrestore(&cachep->spinlock, flags);
@@ -417,11 +418,11 @@ int kmem_cache_destroy(kmem_cache_t* cachep)
 		down(&cache_chain_sem);
 		list_add(&cache_chain, &cachep->next);
 		up(&cache_chain_sem);
-		return 1;
+		return 0;
 	}
 
 	kmem_cache_free(&cache_cache, cachep);
-	return 0;
+	return 1;
 }
 /*-------------------------------------------------------------------------
  *			      Section on slab
@@ -548,6 +549,9 @@ kmem_cache_t *kmem_find_general_cachep(size_t size){
  * @slabp: the slab to be destroyed
  */
 static void kmem_slab_destroy(kmem_cache_t* cachep, slab_t* slabp){
+	kmem_freepages(cachep, slabp->s_mem-slabp->colouroff);
+	if(cachep->flags&CFGS_OFF_SLAB)
+		kmem_cache_free(cachep->slabp_cache, slabp);
 }
 //----------------------------------------------
 //					obj section
@@ -739,26 +743,47 @@ void slab_t_init(void)
 	int i = 0;
 	
 	kmem_cache_t* cache_1 = kmem_cache_create("slab_test", sizeof(slab_t), 0, SLAB_NO_REAP, slab_ctor);
-	for(;i<cache_1->num+1;i++){
-		slab_t* slab_1 = kmem_cache_alloc(cache_1, 0);
+	
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_1->slabs_full, cache_1->slabs_full.next, &cache_1->slabs_partial, cache_1->slabs_partial.next, &cache_1->slabs_free, cache_1->slabs_free.next);
+	slab_t* slab_1;
+	for(;i<cache_1->num-1;i++){
+		slab_1 = kmem_cache_alloc(cache_1, 0);
 		if(i%cache_1->num==0)
 			kprintf("     object allocated:%p\n", slab_1);
 	}
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_1->slabs_full, cache_1->slabs_full.next, &cache_1->slabs_partial, cache_1->slabs_partial.next, &cache_1->slabs_free, cache_1->slabs_free.next);
+	
+	slab_1 = kmem_cache_alloc(cache_1, 0);
+	kprintf("     object allocated:%p\n", slab_1);
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_1->slabs_full, cache_1->slabs_full.next, &cache_1->slabs_partial, cache_1->slabs_partial.next, &cache_1->slabs_free, cache_1->slabs_free.next);
+	
+	slab_1 = kmem_cache_alloc(cache_1, 0);
+	kprintf("     object allocated:%p\n", slab_1);
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_1->slabs_full, cache_1->slabs_full.next, &cache_1->slabs_partial, cache_1->slabs_partial.next, &cache_1->slabs_free, cache_1->slabs_free.next);
+	
 	kmem_cache_t* cache_2 = kmem_cache_create("slab_test1", sizeof(slab_t), 0, SLAB_NO_REAP, slab_ctor);
 	slab_t* slab_2;
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_2->slabs_full, cache_2->slabs_full.next, &cache_2->slabs_partial, cache_2->slabs_partial.next, &cache_2->slabs_free, cache_2->slabs_free.next);
+	
 	for(i=0;i<1;i++){
 		slab_2 = kmem_cache_alloc(cache_2, 0);
 		//if(i%20==0)
 			kprintf("     object allocate:%p\n", slab_2);
 	}
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_2->slabs_full, cache_2->slabs_full.next, &cache_2->slabs_partial, cache_2->slabs_partial.next, &cache_2->slabs_free, cache_2->slabs_free.next);
 	kmem_cache_free(cache_2, slab_2);
 	kprintf("     object free:%p\n", slab_2);
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_2->slabs_full, cache_2->slabs_full.next, &cache_2->slabs_partial, cache_2->slabs_partial.next, &cache_2->slabs_free, cache_2->slabs_free.next);
 	slab_2 = kmem_cache_alloc(cache_2, 0);
 	kprintf("     object allocate:%p\n", slab_2);
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_2->slabs_full, cache_2->slabs_full.next, &cache_2->slabs_partial, cache_2->slabs_partial.next, &cache_2->slabs_free, cache_2->slabs_free.next);
+	kmem_cache_free(cache_2, slab_2);
+	kprintf("     object free:%p\n", slab_2);
+	kprintf("Check list:\n  fu: %p, %p\n  p:%p, %p\n  fr:%p, %p\n", &cache_2->slabs_full, cache_2->slabs_full.next, &cache_2->slabs_partial, cache_2->slabs_partial.next, &cache_2->slabs_free, cache_2->slabs_free.next);
 
-	//if(kmem_cache_destroy(cache_2))
-	//	kprintf("error: unable to destroy");
-	//cache_2 = kmem_cache_create("slab_test1", sizeof(slab_t), 0, SLAB_NO_REAP, slab_ctor);
+	if(!kmem_cache_destroy(cache_2))
+		kprintf("error: unable to destroy");
+	cache_2 = kmem_cache_create("slab_test1", sizeof(slab_t), 0, SLAB_NO_REAP, slab_ctor);
 }
 #endif
 void BUG(const char* bug_location, char* bug_info){
