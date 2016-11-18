@@ -215,7 +215,8 @@ calculate_slab_order(kmem_cache_t * cachep, size_t objsize, size_t align,
 				    objsize - sizeof(slab_t);
 				off_slab_limit /= sizeof(kmem_bufctl_t);
 				if (num > off_slab_limit) {
-					panic("off_slab: objsize = %d, num = %d.",
+					panic
+					    ("off_slab: objsize = %d, num = %d.",
 					     objsize, num);
 				}
 			}
@@ -348,9 +349,11 @@ static bool kmem_cache_grow(kmem_cache_t * cachep)
 	slabp->free = 0;
 
 	local_intr_save(intr_flag);
-	spinlock_acquire(&cachep->lock);
-	list_add(&(cachep->slabs_notfull), &(slabp->slab_link));
-	spinlock_release(&cachep->lock);
+	{
+		spinlock_acquire(&cachep->lock);
+		list_add(&(cachep->slabs_notfull), &(slabp->slab_link));
+		spinlock_release(&cachep->lock);
+	}
 	local_intr_restore(intr_flag);
 	return 1;
 
